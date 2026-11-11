@@ -35,22 +35,59 @@ public static class Lab03Identity
 
     public static void MapLab03Identity(this WebApplication app)
     {
-        app.MapPost("/api/auth/register", async (RegistrationInput input, UserManager<ApplicationUser> users) =>
+        app.MapPost("/api/auth/register", async (
+    RegistrationInput input,
+    UserManager<ApplicationUser> users) =>
         {
-            // ЛР 03: завершіть DTO validation та перевірки довірчої межі.
-            if (string.IsNullOrWhiteSpace(input.UserName) || string.IsNullOrWhiteSpace(input.Email)
-                || string.IsNullOrWhiteSpace(input.DisplayName) || string.IsNullOrEmpty(input.Password))
-                return Results.BadRequest();
+            // Валідація обов'язкових полів
+            if (string.IsNullOrWhiteSpace(input.UserName) ||
+                string.IsNullOrWhiteSpace(input.Email) ||
+                string.IsNullOrWhiteSpace(input.DisplayName) ||
+                string.IsNullOrWhiteSpace(input.Password))
+            {
+                return Results.BadRequest(new { message = "Registration failed" });
+            }
+
+            // Створення користувача (без обчислення хешу вручну)
             var user = new ApplicationUser
             {
-                Id = Guid.NewGuid(), UserName = input.UserName.Trim(), Email = input.Email.Trim(),
+                Id = Guid.NewGuid(),
+                UserName = input.UserName.Trim(),
+                Email = input.Email.Trim(),
                 DisplayName = input.DisplayName.Trim()
             };
+
             var result = await users.CreateAsync(user, input.Password);
-            if (!result.Succeeded) return Results.BadRequest(new { message = "Registration failed" });
-            var role = await users.AddToRoleAsync(user, DbSeeder.ReporterRole);
-            if (!role.Succeeded) throw new InvalidOperationException("Default role assignment failed.");
-            return Results.Created("/api/me", new { user.Id, user.UserName, user.DisplayName });
+
+            if (!result.Succeeded)
+            {
+                // Повертаємо 409 Conflict при дублікаті username/email
+                bool duplicate = result.Errors.Any(error =>
+                    error.Code == "DuplicateUserName" || error.Code == "DuplicateEmail");
+
+                if (duplicate)
+                {
+                    return Results.Conflict(new { message = "Registration conflict" });
+                }
+
+                return Results.BadRequest(new { message = "Registration failed" });
+            }
+
+            // Призначення ролі за замовчуванням (Reporter)
+            var roleResult = await users.AddToRoleAsync(user, DbSeeder.ReporterRole);
+            if (!roleResult.Succeeded)
+            {
+                throw new InvalidOperationException("Default role assignment failed.");
+            }
+
+            // Safe Response DTO (без PasswordHash, SecurityStamp тощо)
+            var response = new RegistrationResponse(
+                user.Id,
+                user.UserName!,
+                user.DisplayName
+            );
+
+            return Results.Created("/api/me", response);
         });
         app.MapPost("/api/auth/login", async (LoginInput input, SignInManager<ApplicationUser> signIn) =>
         {
@@ -59,15 +96,29 @@ public static class Lab03Identity
             var result = await signIn.PasswordSignInAsync(input.UserName, input.Password, false, false);
             return result.Succeeded ? Results.NoContent() : Results.Unauthorized();
         });
-        app.MapPost("/api/auth/logout", () => Results.StatusCode(StatusCodes.Status501NotImplemented));
-        // Навмисно хибна навчальна довіра: ЛР 03 замінює заявлений id на verified principal.
-        app.MapGet("/api/me", async (HttpContext context, SecureLabDbContext db) =>
+        app.MapPost("/api/auth/logout", async (SignInManager<ApplicationUser> signIn) =>
         {
-            if (!Guid.TryParse(context.Request.Headers["X-Demo-UserId"], out var claimedId))
-                return Results.StatusCode(StatusCodes.Status501NotImplemented);
-            var user = await db.Users.FindAsync(claimedId);
-            return user is null ? Results.NotFound() : Results.Ok(new { user.Id, user.UserName, user.DisplayName });
-        });
+            await signIn.SignOutAsync();
+            return Results.NoContent();
+        }).RequireAuthorization();
+        app.MapGet("/api/me", async (
+    HttpContext context,
+    UserManager<ApplicationUser> users) =>
+        {
+            // Данні користувача зчитуються ВИКЛЮЧНО з verified principal (HttpContext.User)
+            var user = await users.GetUserAsync(context.User);
+            if (user is null)
+            {
+                return Results.Unauthorized();
+            }
+
+            return Results.Ok(new
+            {
+                id = user.Id,
+                userName = user.UserName,
+                displayName = user.DisplayName
+            });
+        }).RequireAuthorization();
         // Приклад лише mechanics: не повертає identity і не реалізує оцінювану operation.
         app.MapGet("/api/auth/session-check", () => Results.NoContent()).RequireAuthorization();
     }
@@ -75,3 +126,4 @@ public static class Lab03Identity
 
 public sealed record RegistrationInput(string? UserName, string? Email, string? DisplayName, string? Password);
 public sealed record LoginInput(string? UserName, string? Password);
+public sealed record RegistrationResponse(Guid Id, string UserName, string DisplayName);

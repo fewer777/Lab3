@@ -2,6 +2,7 @@ using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
 using SecureLab.Api.Data;
 using SecureLab.Api.Data.Entities;
+using Microsoft.AspNetCore.Identity;
 
 namespace SecureLab.Api.Scaffolding;
 
@@ -13,122 +14,60 @@ public static class Lab02Endpoints
         // ЕТАП 2: POST /api/incidents — Серверна валідація та DTO
         // ------------------------------------------------------------------
         app.MapPost("/api/incidents", async (
-            CreateIncidentRequest request,
-            SecureLabDbContext db,
-            CancellationToken ct) =>
+    CreateIncidentRequest request,
+    HttpContext httpContext,
+    UserManager<ApplicationUser> users,
+    SecureLabDbContext db) =>
         {
+            // 1. Отримуємо поточного користувача з verified principal
+            var currentUser = await users.GetUserAsync(httpContext.User);
+            if (currentUser is null)
+            {
+                return Results.Unauthorized();
+            }
+
+            // 2. Перевіряємо валідацію полів та парсимо severity (як у ЛР 2)
+            if (string.IsNullOrWhiteSpace(request.Title) ||
+                string.IsNullOrWhiteSpace(request.Description) ||
+                !request.OccurredAtUtc.HasValue)
+            {
+                return Results.BadRequest(new { message = "Invalid incident data" });
+            }
+
+            if (!Enum.TryParse<IncidentSeverity>(request.Severity, true, out var severity))
+            {
+                return Results.BadRequest(new { message = "Invalid severity level" });
+            }
+
+            // 3. Створюємо інцидент
             var now = DateTimeOffset.UtcNow;
-            var errors = new Dictionary<string, string[]>();
-
-            // 1. Перевірка Title (Обов'язковий, max 160 символів)
-            if (string.IsNullOrWhiteSpace(request.Title))
-            {
-                errors["title"] = ["Title is required."];
-            }
-            else if (request.Title.Length > 160)
-            {
-                errors["title"] = ["Max title length is 160 chars."];
-            }
-
-            // 2. Перевірка Description (Обов'язковий, max 4000 символів)
-            if (string.IsNullOrWhiteSpace(request.Description))
-            {
-                errors["description"] = ["Description is required."];
-            }
-            else if (request.Description.Length > 4000)
-            {
-                errors["description"] = ["Max description length is 4000 chars."];
-            }
-
-            // 3. Перевірка Severity (Enum: Low, Medium, High, Critical)
-            IncidentSeverity severity = default;
-            var severityIsValid = !string.IsNullOrWhiteSpace(request.Severity)
-                                  && Enum.TryParse<IncidentSeverity>(request.Severity, ignoreCase: true, out severity)
-                                  && Enum.IsDefined(severity);
-
-            if (!severityIsValid)
-            {
-                errors["severity"] = ["Allowed values: Low, Medium, High, Critical."];
-            }
-
-            // 4. Перевірка OccurredAtUtc (Обов'язковий, не більше +5 хв у майбутнє)
-            if (request.OccurredAtUtc is null)
-            {
-                errors["occurredAtUtc"] = ["OccurredAtUtc is required."];
-            }
-            else if (request.OccurredAtUtc.Value > now.AddMinutes(5))
-            {
-                errors["occurredAtUtc"] = ["Date cannot be more than 5 minutes ahead of server UTC time."];
-            }
-
-            // 5. Cross-field перевірка для High / Critical (min 40 символів в описі)
-            var normalizedTitle = request.Title?.Trim() ?? string.Empty;
-            var normalizedDescription = request.Description?.Trim() ?? string.Empty;
-
-            if (severityIsValid && (severity == IncidentSeverity.High || severity == IncidentSeverity.Critical))
-            {
-                if (!errors.ContainsKey("description") && normalizedDescription.Length < 40)
-                {
-                    errors["description"] = ["Description for High/Critical must be at least 40 chars long."];
-                }
-            }
-
-            // Повертаємо 400 ValidationProblem за наявності помилок
-            if (errors.Count > 0)
-            {
-                return Results.ValidationProblem(errors);
-            }
-
-            // 6. Перевірка предметного конфлікту 409 (дублікат Title в активних статусах)
-            var activeStatuses = new[]
-            {
-                IncidentStatus.New,
-                IncidentStatus.Triaged,
-                IncidentStatus.InProgress,
-                IncidentStatus.Resolved
-            };
-
-            var hasDuplicateTitle = await db.Incidents.AnyAsync(
-                i => i.Title == normalizedTitle && activeStatuses.Contains(i.Status),
-                ct);
-
-            if (hasDuplicateTitle)
-            {
-                return Results.Problem(
-                    statusCode: StatusCodes.Status409Conflict,
-                    title: "Incident Title Conflict",
-                    detail: "An active incident with the same title already exists.");
-            }
-
-            // 7. Створення сутності (Server-managed поля)
             var incident = new Incident
             {
                 Id = Guid.NewGuid(),
-                Title = normalizedTitle,
-                Description = normalizedDescription,
-                Severity = severity,
+                OwnerUserId = currentUser.Id, // Сервер сам призначає власника з verified principal
+                Title = request.Title.Trim(),
+                Description = request.Description.Trim(),
+                Severity = severity, // Тепер зміна severity оголошена та присутня в контексті!
                 Status = IncidentStatus.New,
-                OccurredAtUtc = request.OccurredAtUtc!.Value.ToUniversalTime(),
+                OccurredAtUtc = request.OccurredAtUtc.Value.ToUniversalTime(),
                 CreatedAtUtc = now,
-                UpdatedAtUtc = now,
-                OwnerUserId = DbSeeder.AliceId
+                UpdatedAtUtc = now
             };
 
             db.Incidents.Add(incident);
-            await db.SaveChangesAsync(ct);
+            await db.SaveChangesAsync();
 
-            // 8. DTO відповіді (201 Created)
-            var response = new CreatedIncidentResponse(
-                incident.Id,
-                incident.Title,
-                incident.Description,
-                incident.Severity.ToString(),
-                incident.Status.ToString(),
-                incident.OccurredAtUtc,
-                incident.CreatedAtUtc);
-
-            return Results.Created($"/api/incidents/{incident.Id}", response);
-        });
+            return Results.Created($"/api/incidents/{incident.Id}", new
+            {
+                id = incident.Id,
+                title = incident.Title,
+                description = incident.Description,
+                severity = incident.Severity.ToString(),
+                status = incident.Status.ToString(),
+                occurredAtUtc = incident.OccurredAtUtc,
+                createdAtUtc = incident.CreatedAtUtc
+            });
+        }).RequireAuthorization();
 
         // ------------------------------------------------------------------
         // ЕТАП 3-4: GET /api/incidents/search — Безпечний пошук через LINQ
